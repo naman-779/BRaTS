@@ -1,0 +1,30 @@
+# Data (40 GB)
+Brats GLI/
+BRats GLI/
+synthetic_data/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints & training outputs
+checkpoints/
+runs/
+predictions/
+predictions_ensemble/
+*.pth
+
+# Logs
+*.log
+*.csv
+
+# macOS
+.DS_Store
+
+# IDE / tools
+.claude/
+
+# Paper PDF
+*.pdf
