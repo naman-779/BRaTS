@@ -1,5 +1,7 @@
 import os
+import random as _random
 
+import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 
@@ -8,6 +10,7 @@ from monai.transforms import (
     Compose,
     LoadImaged,
     EnsureChannelFirstd,
+    MapTransform,
     Orientationd,
     NormalizeIntensityd,
     RandSpatialCropd,
@@ -17,6 +20,7 @@ from monai.transforms import (
     RandShiftIntensityd,
     RandGaussianNoised,
     RandGaussianSmoothd,
+    SpatialPadd,
     EnsureTyped,
 )
 
@@ -28,8 +32,11 @@ def build_data_list(data_root, split_dir, modalities, has_labels=True):
         "image": list of 4 modality paths
         "label": path to seg file (only if has_labels)
         "case_id": str
+
+    split_dir may be an absolute path (e.g. synthetic_data dir); if so,
+    data_root is ignored for path construction.
     """
-    split_path = os.path.join(data_root, split_dir)
+    split_path = split_dir if os.path.isabs(split_dir) else os.path.join(data_root, split_dir)
     cases = sorted(
         [d for d in os.listdir(split_path) if os.path.isdir(os.path.join(split_path, d))]
     )
@@ -117,8 +124,118 @@ def get_inference_transforms():
     )
 
 
-def get_dataloaders(config):
-    """Build train and val dataloaders from config."""
+class ExtractRandomSlice2d(MapTransform):
+    """
+    Extracts a single random non-empty axial slice from a loaded 3-D volume.
+
+    Expects volumes already processed by EnsureChannelFirst + Orientationd(RAS),
+    so spatial shape is (C, H, W, D) where D is the axial (S) dimension.
+    After extraction each key becomes (C, H, W).
+    """
+
+    def __init__(self, keys, label_key: str = "label"):
+        super().__init__(keys, allow_missing_keys=False)
+        self.label_key = label_key
+
+    def __call__(self, data):
+        d = dict(data)
+        lbl = d[self.label_key]                        # (1, H, W, D)
+        lbl_arr = np.asarray(lbl)
+        D = lbl_arr.shape[-1]
+
+        nonempty = [z for z in range(D) if lbl_arr[0, :, :, z].max() > 0]
+        z = int(_random.choice(nonempty)) if nonempty else D // 2
+
+        for key in self.key_iterator(d):
+            d[key] = d[key][..., z]                    # (C, H, W, D) → (C, H, W)
+        return d
+
+
+def get_train_transforms_2d():
+    return Compose([
+        LoadImaged(keys=["image", "label"], image_only=True),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+        ExtractRandomSlice2d(keys=["image", "label"]),
+        SpatialPadd(keys=["image", "label"], spatial_size=(220, 220)),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+        RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+        RandScaleIntensityd(keys="image", factors=0.1, prob=0.5),
+        RandShiftIntensityd(keys="image", offsets=0.1, prob=0.5),
+        RandGaussianNoised(keys="image", prob=0.2, mean=0.0, std=0.1),
+        EnsureTyped(keys=["image", "label"]),
+    ])
+
+
+def get_val_transforms_2d():
+    return Compose([
+        LoadImaged(keys=["image", "label"], image_only=True),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+        ExtractRandomSlice2d(keys=["image", "label"]),
+        SpatialPadd(keys=["image", "label"], spatial_size=(220, 220)),
+        EnsureTyped(keys=["image", "label"]),
+    ])
+
+
+def get_dataloaders_2d(config, synthetic_data_dir=None):
+    """Build 2-D slice train/val dataloaders for the hierarchical model.
+
+    synthetic_data_dir: optional path to GAN-generated cases. Appended to
+    training split only.
+    """
+    data_root = config["data_root"]
+    modalities = config["modalities"]
+    seed = config["seed"]
+    val_frac = config["val_split"]
+    batch_size = config["training"]["batch_size"]
+    num_workers = config["training"]["num_workers"]
+
+    all_data = build_data_list(data_root, config["train_dir"], modalities, has_labels=True)
+
+    if "data_fraction" in config and config["data_fraction"] < 1.0:
+        _random.seed(seed)
+        subset_size = int(len(all_data) * config["data_fraction"])
+        all_data = _random.sample(all_data, subset_size)
+
+    train_data, val_data = split_train_val(all_data, val_frac, seed)
+
+    if synthetic_data_dir:
+        synth_list = build_data_list(
+            os.path.abspath(synthetic_data_dir),
+            os.path.abspath(synthetic_data_dir),
+            modalities,
+            has_labels=True,
+        )
+        train_data = train_data + synth_list
+        print(f"Synthetic data: added {len(synth_list)} cases to training split")
+
+    train_ds = Dataset(data=train_data, transform=get_train_transforms_2d())
+    val_ds = Dataset(data=val_data, transform=get_val_transforms_2d())
+
+    use_pin_memory = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=use_pin_memory,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=use_pin_memory,
+    )
+    return train_loader, val_loader
+
+
+def get_dataloaders(config, synthetic_data_dir=None):
+    """Build train and val dataloaders from config.
+
+    synthetic_data_dir: optional path to a directory of GAN-generated cases
+    (same layout as the BraTS training dir). Cases there are appended to the
+    training split only — validation always uses real data.
+    """
     data_root = config["data_root"]
     modalities = config["modalities"]
     seed = config["seed"]
@@ -138,6 +255,16 @@ def get_dataloaders(config):
         all_data = random.sample(all_data, subset_size)
 
     train_data, val_data = split_train_val(all_data, val_frac, seed)
+
+    if synthetic_data_dir:
+        synth_list = build_data_list(
+            os.path.abspath(synthetic_data_dir),
+            os.path.abspath(synthetic_data_dir),
+            modalities,
+            has_labels=True,
+        )
+        train_data = train_data + synth_list
+        print(f"Synthetic data: added {len(synth_list)} cases to training split")
 
     train_ds = CacheDataset(
         data=train_data,

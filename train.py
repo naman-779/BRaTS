@@ -86,6 +86,8 @@ def main():
     parser = argparse.ArgumentParser(description="BRaTS 2024 Baseline Training")
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--synthetic_data_dir", type=str, default=None,
+                        help="Directory of GAN-generated cases to add to training (optional)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -106,7 +108,7 @@ def main():
 
     # Data
     logger.info("Building dataloaders...")
-    train_loader, val_loader = get_dataloaders(config)
+    train_loader, val_loader = get_dataloaders(config, synthetic_data_dir=args.synthetic_data_dir)
     logger.info(f"Train: {len(train_loader.dataset)} cases, Val: {len(val_loader.dataset)} cases")
 
     # Model

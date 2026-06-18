@@ -1,0 +1,49 @@
+# Hierarchical 2-D Slice-by-Slice Segmentation
+# HierarchicalSegNet + MONAI
+
+# --- Paths ---
+# UPDATE: set to the absolute path of the folder containing training_data1_v2/ and validation_data/
+data_root: "/path/to/BraTS_data"
+train_dir: "training_data1_v2"
+val_dir: "validation_data"
+output_dir: "./runs_hierarchical"
+checkpoint_dir: "./checkpoints_hierarchical"
+
+# --- Data ---
+modalities: ["t1n", "t1c", "t2w", "t2f"]
+num_classes: 5           # 0=BG, 1=NETC, 2=SNFH, 3=ET, 4=RC
+num_input_channels: 4
+val_split: 0.1
+data_fraction: 1.0
+seed: 42
+
+# --- Model ---
+model:
+  name: "HierarchicalSegNet"
+  in_channels: 4
+  init_filters: 16       # per head; 4 heads ≈ 4 M params total
+  dropout_prob: 0.1
+
+# --- Training ---
+training:
+  batch_size: 8          # 2D slices are cheap; larger batch improves gradient stability
+  num_workers: 4
+  max_epochs: 200
+  val_interval: 10
+  amp: true
+  cache_rate: 0.0
+
+# --- Loss ---
+loss:
+  lambda_tc: 1.0
+  lambda_et: 1.0
+  lambda_rc: 2.0         # upweight RC — rarest and hardest region
+
+# --- Optimizer ---
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+
+# --- Scheduler ---
+scheduler:
+  warmup_epochs: 15

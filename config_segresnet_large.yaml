@@ -12,7 +12,7 @@ modalities: ["t1n", "t1c", "t2w", "t2f"]
 num_classes: 5           # 0=BG, 1=NETC, 2=SNFH, 3=ET, 4=RC
 num_input_channels: 4
 val_split: 0.1
-data_fraction: 0.03      # Use ~40 cases for quick baseline
+data_fraction: 1.0
 seed: 42
 
 # --- Model ---

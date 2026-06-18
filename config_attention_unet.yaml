@@ -1,4 +1,4 @@
-# SwinUNETR — 3D Shifted-Window Transformer
+# Attention U-Net — 3D with attention gates on skip connections
 # Trains with train.py, infers with inference.py
 
 # --- Paths ---
@@ -6,8 +6,8 @@
 data_root: "/path/to/BraTS_data"
 train_dir: "training_data1_v2"
 val_dir: "validation_data"
-output_dir: "./runs_swinunetr"
-checkpoint_dir: "./checkpoints_swinunetr"
+output_dir: "./runs_attention_unet"
+checkpoint_dir: "./checkpoints_attention_unet"
 
 # --- Data ---
 modalities: ["t1n", "t1c", "t2w", "t2f"]
@@ -18,23 +18,24 @@ data_fraction: 1.0
 seed: 42
 
 # --- Model ---
+# channels: feature map sizes at each encoder level (5 levels)
+# strides:  downsampling between levels (4 steps: 128→64→32→16→8)
 model:
-  name: "SwinUNETR"
+  name: "AttentionUnet"
   spatial_dims: 3
   in_channels: 4
   out_channels: 5
-  feature_size: 48       # full model size from paper (24 was reduced for MPS)
-  drop_rate: 0.0
-  attn_drop_rate: 0.0
-  use_checkpoint: true   # gradient checkpointing — saves ~30% VRAM at minor speed cost
+  channels: [32, 64, 128, 256, 320]
+  strides: [2, 2, 2, 2]
+  dropout: 0.1
 
 # --- Training ---
 training:
-  roi_size: [96, 96, 96]
-  batch_size: 1
+  roi_size: [128, 128, 128]
+  batch_size: 2
   num_workers: 4
-  max_epochs: 500
-  val_interval: 25
+  max_epochs: 300
+  val_interval: 20
   amp: true
   cache_rate: 0.1
 
@@ -53,11 +54,11 @@ optimizer:
 
 # --- Scheduler ---
 scheduler:
-  warmup_epochs: 50
+  warmup_epochs: 30
 
 # --- Inference ---
 inference:
-  roi_size: [96, 96, 96]
-  sw_batch_size: 2
+  roi_size: [128, 128, 128]
+  sw_batch_size: 4
   overlap: 0.5
   mode: "gaussian"
