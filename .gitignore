@@ -26,5 +26,3 @@ predictions_ensemble/
 # IDE / tools
 .claude/
 
-# Paper PDF
-*.pdf
