@@ -45,6 +45,7 @@ loss:
   include_background: false
   lambda_dice: 1.0
   lambda_ce: 1.0
+  lambda_hausdorff: 0.1  # boundary-aware HausdorffDT term; set to 0.0 to disable
 
 # --- Optimizer ---
 optimizer:

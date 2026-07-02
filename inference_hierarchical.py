@@ -30,6 +30,8 @@ from monai.transforms import (
 
 from src.data import build_data_list
 from src.model import build_model
+from src.transforms import AnatomicalConstraints
+from src.tta import tta_hierarchical_slice
 from src.utils import get_device, load_checkpoint, load_config
 
 
@@ -72,9 +74,10 @@ def _combine_slice(wt_prob, tc_prob, et_prob, rc_prob) -> np.ndarray:
 
 
 @torch.no_grad()
-def infer_volume(model, volume: np.ndarray, device: torch.device) -> np.ndarray:
+def infer_volume(model, volume: np.ndarray, device: torch.device, use_tta: bool = False) -> np.ndarray:
     """
-    volume : (4, H, W, D) float32 numpy array in RAS space.
+    volume  : (4, H, W, D) float32 numpy array in RAS space.
+    use_tta : if True, apply 4-flip test-time augmentation per slice.
     Returns (H, W, D) uint8 segmentation in the same space.
     """
     H, W, D = volume.shape[1], volume.shape[2], volume.shape[3]
@@ -88,19 +91,24 @@ def infer_volume(model, volume: np.ndarray, device: torch.device) -> np.ndarray:
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, (0, pad_w, 0, pad_h))
 
-        wt_logits, tc_logits, et_logits, rc_logits = model(x)
-
-        wt_p = torch.softmax(wt_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
-        tc_p = torch.softmax(tc_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
-        et_p = torch.softmax(et_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
-        rc_p = torch.softmax(rc_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
+        if use_tta:
+            wt_p, tc_p, et_p, rc_p = tta_hierarchical_slice(model, x, H, W)
+        else:
+            wt_logits, tc_logits, et_logits, rc_logits = model(x)
+            wt_p = torch.softmax(wt_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
+            tc_p = torch.softmax(tc_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
+            et_p = torch.softmax(et_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
+            rc_p = torch.softmax(rc_logits, dim=1)[0, 1, :H, :W].cpu().numpy()
 
         pred_3d[:, :, z] = _combine_slice(wt_p, tc_p, et_p, rc_p)
 
     return pred_3d
 
 
-def run_inference(config, checkpoint_path, input_dir, output_dir, max_cases=None):
+def run_inference(
+    config, checkpoint_path, input_dir, output_dir,
+    max_cases=None, use_tta=False, anatomy_fix=True,
+):
     device = get_device()
     os.makedirs(output_dir, exist_ok=True)
 
@@ -114,31 +122,33 @@ def run_inference(config, checkpoint_path, input_dir, output_dir, max_cases=None
     model = build_model(config).to(device)
     load_checkpoint(checkpoint_path, model)
     model.eval()
+
+    tta_str = " +TTA(4-flip)" if use_tta else ""
     print(f"Loaded checkpoint: {checkpoint_path}")
-    print(f"Running inference on {len(data_list)} cases from {input_dir}")
+    print(f"Running inference on {len(data_list)} cases from {input_dir}{tta_str}")
 
     load_tfm = _get_load_transform()
+    anatomy = AnatomicalConstraints(dilation_radius=3) if anatomy_fix else None
 
     for i, case in enumerate(data_list):
         case_id = case["case_id"]
 
-        # Load and preprocess the 3-D volume
         sample = load_tfm({"image": case["image"]})
         img_tensor = sample["image"]
         volume = np.array(img_tensor, dtype=np.float32)     # (4, H, W, D)
 
-        # Infer slice-by-slice
-        pred_3d = infer_volume(model, volume, device)       # (H, W, D)
+        pred_3d = infer_volume(model, volume, device, use_tta=use_tta)  # (H, W, D)
 
-        # Save NIfTI — affine from the MetaTensor tracks the RAS reorientation
+        if anatomy is not None:
+            pred_3d = anatomy(pred_3d)
+
         if hasattr(img_tensor, "affine"):
             affine = img_tensor.affine.numpy()
         else:
             affine = nib.load(case["image"][0]).affine
 
-        out_nii = nib.Nifti1Image(pred_3d, affine=affine)
-        out_path = os.path.join(output_dir, f"{case_id}.nii.gz")
-        nib.save(out_nii, out_path)
+        nib.save(nib.Nifti1Image(pred_3d, affine=affine),
+                 os.path.join(output_dir, f"{case_id}.nii.gz"))
 
         if (i + 1) % 5 == 0 or (i + 1) == len(data_list):
             print(f"  [{i+1}/{len(data_list)}] Saved {case_id}")
@@ -154,10 +164,16 @@ def main():
                         help="Subdirectory under data_root (e.g. validation_data)")
     parser.add_argument("--output_dir", default="./predictions_hierarchical")
     parser.add_argument("--max_cases",  type=int, default=None)
+    parser.add_argument("--tta", action="store_true", help="Enable 4-flip test-time augmentation")
+    parser.add_argument("--no_anatomy_fix", action="store_true",
+                        help="Disable anatomical constraint post-processing")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    run_inference(config, args.checkpoint, args.input_dir, args.output_dir, args.max_cases)
+    run_inference(
+        config, args.checkpoint, args.input_dir, args.output_dir,
+        max_cases=args.max_cases, use_tta=args.tta, anatomy_fix=not args.no_anatomy_fix,
+    )
 
 
 if __name__ == "__main__":

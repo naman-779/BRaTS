@@ -1,20 +1,27 @@
 """
 Ensemble inference across all three model types:
   - HierarchicalSegNet  (2D slice-by-slice)
-  - DynUNet             (3D sliding window)
+  - AttentionUnet       (3D sliding window)
   - SwinUNETR           (3D sliding window)
 
 Each model produces a (5, H, W, D) soft probability map.
-These are averaged and argmax-ed to produce the final segmentation.
+Three ensemble strategies are supported:
+  simple        — plain mean across models (default)
+  dice_weighted — region-specific weighted average from a JSON file of
+                  per-class Dice scores computed on the validation set
+  uncertainty   — per-voxel entropy-weighted average (low-confidence
+                  model predictions contribute less to the final answer)
 
 Usage:
     python ensemble_all_models.py \\
-        --configs config_hierarchical_2d.yaml config_dynunet.yaml config_swinunetr.yaml \\
+        --configs config_hierarchical_2d.yaml config_attention_unet.yaml config_swinunetr.yaml \\
         --checkpoints checkpoints_hierarchical/best_model_hierarchical.pth \\
-                      checkpoints_dynunet/best_model.pth \\
+                      checkpoints_attention_unet/best_model.pth \\
                       checkpoints_swinunetr/best_model.pth \\
         --input_dir validation_data \\
-        --output_dir ./predictions_ensemble_all
+        --output_dir ./predictions_ensemble_all \\
+        --weighting uncertainty \\
+        --tta
 """
 import argparse
 import json
@@ -36,7 +43,8 @@ from monai.transforms import (
 
 from src.data import build_data_list
 from src.model import build_model
-from src.transforms import RemoveSmallConnectedComponents
+from src.transforms import AnatomicalConstraints, RemoveSmallConnectedComponents
+from src.tta import tta_hierarchical_slice, tta_sliding_window
 from src.utils import get_device, load_checkpoint, load_config
 
 
@@ -49,30 +57,30 @@ _LOAD_TRANSFORM = Compose([
 ])
 
 
-def _get_3d_probs(model, volume: np.ndarray, device, roi_size, sw_batch_size, overlap, sw_mode):
+def _get_3d_probs(model, volume: np.ndarray, device, roi_size, sw_batch_size, overlap, sw_mode,
+                  use_tta: bool = False):
     """
-    3-D sliding window inference.
+    3-D sliding window inference (optionally with 8-flip TTA).
     volume : (4, H, W, D) float32
     Returns (5, H, W, D) float32 probability map.
     """
     x = torch.from_numpy(volume).unsqueeze(0).float().to(device)  # (1, 4, H, W, D)
     with torch.no_grad():
-        out = sliding_window_inference(
-            x,
-            roi_size=roi_size,
-            sw_batch_size=sw_batch_size,
-            predictor=model,
-            overlap=overlap,
-            mode=sw_mode,
-        )
-    return torch.softmax(out, dim=1)[0].cpu().numpy()  # (5, H, W, D)
+        if use_tta:
+            probs = tta_sliding_window(model, x, roi_size, sw_batch_size, overlap, sw_mode)
+            return probs[0].cpu().numpy()  # (5, H, W, D)
+        else:
+            out = sliding_window_inference(
+                x, roi_size=roi_size, sw_batch_size=sw_batch_size,
+                predictor=model, overlap=overlap, mode=sw_mode,
+            )
+            return torch.softmax(out, dim=1)[0].cpu().numpy()  # (5, H, W, D)
 
 
-def _get_hierarchical_probs(model, volume: np.ndarray, device):
+def _get_hierarchical_probs(model, volume: np.ndarray, device, use_tta: bool = False):
     """
-    2-D slice-by-slice inference for HierarchicalSegNet.
-    Converts the 4 binary head outputs into a normalised 5-class
-    probability map so it can be averaged with the 3-D models.
+    2-D slice-by-slice inference for HierarchicalSegNet (optionally with 4-flip TTA).
+    Converts the 4 binary head outputs into a normalised 5-class probability map.
 
     volume : (4, H, W, D) float32
     Returns (5, H, W, D) float32 probability map.
@@ -91,12 +99,14 @@ def _get_hierarchical_probs(model, volume: np.ndarray, device):
             if pad_h > 0 or pad_w > 0:
                 x = F.pad(x, (0, pad_w, 0, pad_h))
 
-            wt_l, tc_l, et_l, rc_l = model(x)
-
-            p_wt = torch.softmax(wt_l, dim=1)[0, 1, :H, :W].cpu().numpy()  # (H, W)
-            p_tc = torch.softmax(tc_l, dim=1)[0, 1, :H, :W].cpu().numpy()
-            p_et = torch.softmax(et_l, dim=1)[0, 1, :H, :W].cpu().numpy()
-            p_rc = torch.softmax(rc_l, dim=1)[0, 1, :H, :W].cpu().numpy()
+            if use_tta:
+                p_wt, p_tc, p_et, p_rc = tta_hierarchical_slice(model, x, H, W)
+            else:
+                wt_l, tc_l, et_l, rc_l = model(x)
+                p_wt = torch.softmax(wt_l, dim=1)[0, 1, :H, :W].cpu().numpy()
+                p_tc = torch.softmax(tc_l, dim=1)[0, 1, :H, :W].cpu().numpy()
+                p_et = torch.softmax(et_l, dim=1)[0, 1, :H, :W].cpu().numpy()
+                p_rc = torch.softmax(rc_l, dim=1)[0, 1, :H, :W].cpu().numpy()
 
             # Decompose into 5-class soft probabilities via the hierarchy
             p_snfh = p_wt * (1.0 - p_tc)
@@ -112,27 +122,50 @@ def _get_hierarchical_probs(model, volume: np.ndarray, device):
     return probs  # (5, H, W, D)
 
 
-def _apply_weights(prob_maps: list, entries: list, weights: dict) -> np.ndarray:
+def _apply_dice_weights(prob_maps: list, entries: list, weights: dict) -> np.ndarray:
     """
-    Region-specific weighted average of probability maps.
+    Region-specific weighted average using pre-computed per-class Dice scores.
 
-    For each class c, each model's contribution is scaled by its
-    pre-computed Dice weight for that class (weights sum to 1 per class).
-
-    prob_maps : list of (5, H, W, D) arrays, one per model
-    entries   : list of (model, cfg, mode) tuples — used to look up model names
-    weights   : { model_name: [w_bg, w_netc, w_snfh, w_et, w_rc] }
+    weights : { model_name: [w_bg, w_netc, w_snfh, w_et, w_rc] }
+              (weights per class should sum to 1 across models)
     """
     combined = np.zeros_like(prob_maps[0])  # (5, H, W, D)
-    for (_, cfg, _), probs in zip(entries, prob_maps):
-        model_name = cfg["model"]["name"]
-        w = np.array(weights[model_name], dtype=np.float32)  # (5,)
-        combined += probs * w.reshape(5, 1, 1, 1)
-    return combined  # already weighted-summed; weights per class sum to 1
+    for (_, cfg, _), p in zip(entries, prob_maps):
+        w = np.array(weights[cfg["model"]["name"]], dtype=np.float32)  # (5,)
+        combined += p * w.reshape(5, 1, 1, 1)
+    return combined
 
 
-def run_ensemble(configs, checkpoint_paths, input_dir, output_dir,
-                 weights=None, min_size=20, max_cases=None):
+def _uncertainty_ensemble(prob_maps: list) -> np.ndarray:
+    """
+    Per-voxel Shannon entropy-weighted ensemble.
+
+    Models that are uncertain (high entropy softmax) contribute less.
+    Weight for model m at voxel v: 1 / (entropy_m(v) + eps).
+    Weights are normalised across models per voxel.
+
+    prob_maps : list of (5, H, W, D) float32 arrays
+    Returns   : (5, H, W, D) weighted probability map
+    """
+    eps = 1e-8
+    weights = []
+    for p in prob_maps:
+        entropy = -(p * np.log(p + eps)).sum(axis=0, keepdims=True)  # (1, H, W, D)
+        weights.append(1.0 / (entropy + eps))
+
+    total_w = sum(weights)  # (1, H, W, D)
+    combined = np.zeros_like(prob_maps[0])
+    for p, w in zip(prob_maps, weights):
+        combined += p * (w / (total_w + eps))
+    return combined
+
+
+def run_ensemble(
+    configs, checkpoint_paths, input_dir, output_dir,
+    weights=None, weighting="simple",
+    min_size=20, max_cases=None,
+    use_tta=False, anatomy_fix=True,
+):
     device = get_device()
     os.makedirs(output_dir, exist_ok=True)
 
@@ -144,10 +177,9 @@ def run_ensemble(configs, checkpoint_paths, input_dir, output_dir,
     if max_cases is not None:
         data_list = data_list[:max_cases]
 
-    strategy = "region-specific weighted averaging" if weights else "simple averaging"
-    print(f"Ensemble of {len(configs)} models on {len(data_list)} cases [{strategy}]")
+    tta_str = " +TTA" if use_tta else ""
+    print(f"Ensemble of {len(configs)} models | {weighting} weighting{tta_str} | {len(data_list)} cases")
 
-    # Load all models and tag each by inference mode
     entries = []
     for cfg, ckpt in zip(configs, checkpoint_paths):
         model = build_model(cfg).to(device)
@@ -159,11 +191,11 @@ def run_ensemble(configs, checkpoint_paths, input_dir, output_dir,
         print(f"  Loaded {model_name} ({mode}) from {ckpt}")
 
     post_proc = RemoveSmallConnectedComponents(keys=["pred"], min_size=min_size)
+    anatomy = AnatomicalConstraints(dilation_radius=3) if anatomy_fix else None
 
     for i, case in enumerate(data_list):
         case_id = case["case_id"]
 
-        # Load the 3-D volume once — shared across all models
         sample = _LOAD_TRANSFORM({"image": case["image"]})
         img_tensor = sample["image"]
         volume = np.array(img_tensor, dtype=np.float32)  # (4, H, W, D)
@@ -171,31 +203,34 @@ def run_ensemble(configs, checkpoint_paths, input_dir, output_dir,
         prob_maps = []
         for model, cfg, mode in entries:
             if mode == "hierarchical":
-                probs = _get_hierarchical_probs(model, volume, device)
+                p = _get_hierarchical_probs(model, volume, device, use_tta=use_tta)
             else:
                 inf = cfg["inference"]
-                probs = _get_3d_probs(
+                p = _get_3d_probs(
                     model, volume, device,
                     roi_size=tuple(inf["roi_size"]),
                     sw_batch_size=inf["sw_batch_size"],
                     overlap=inf["overlap"],
                     sw_mode=inf["mode"],
+                    use_tta=use_tta,
                 )
-            prob_maps.append(probs)
+            prob_maps.append(p)
 
-        # Combine: region-specific weighted average or simple mean
-        if weights:
-            avg = _apply_weights(prob_maps, entries, weights)
+        if weighting == "uncertainty":
+            avg = _uncertainty_ensemble(prob_maps)
+        elif weighting == "dice_weighted" and weights is not None:
+            avg = _apply_dice_weights(prob_maps, entries, weights)
         else:
             avg = np.mean(prob_maps, axis=0)
 
         pred = avg.argmax(axis=0).astype(np.uint8)  # (H, W, D)
 
-        # Remove tiny false-positive blobs
         result = post_proc({"pred": pred})
         pred = result["pred"]
 
-        # Save NIfTI
+        if anatomy is not None:
+            pred = anatomy(pred)
+
         if hasattr(img_tensor, "affine"):
             affine = img_tensor.affine.numpy()
         else:
@@ -213,16 +248,24 @@ def run_ensemble(configs, checkpoint_paths, input_dir, output_dir,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BRaTS ensemble: HierarchicalSegNet + AttentionUnet + SwinUNETR")
+    parser = argparse.ArgumentParser(
+        description="BRaTS ensemble: HierarchicalSegNet + AttentionUnet + SwinUNETR"
+    )
     parser.add_argument("--configs",     nargs="+", required=True, help="Config YAML for each model")
     parser.add_argument("--checkpoints", nargs="+", required=True, help="Checkpoint for each model (same order)")
     parser.add_argument("--input_dir",   default="validation_data")
     parser.add_argument("--output_dir",  default="./predictions_ensemble_all")
+    parser.add_argument("--weighting",   default="simple",
+                        choices=["simple", "dice_weighted", "uncertainty"],
+                        help="Ensemble strategy: simple mean, Dice-score-weighted, or uncertainty-weighted")
     parser.add_argument("--weights",     default=None,
-                        help="Path to ensemble_weights.json from compute_weights.py. "
-                             "If omitted, falls back to simple averaging.")
+                        help="Path to ensemble_weights.json (required for --weighting dice_weighted)")
     parser.add_argument("--min_size",    type=int, default=20)
     parser.add_argument("--max_cases",   type=int, default=None)
+    parser.add_argument("--tta",         action="store_true",
+                        help="Enable test-time augmentation (8-flip 3D / 4-flip 2D)")
+    parser.add_argument("--no_anatomy_fix", action="store_true",
+                        help="Disable anatomical constraint post-processing")
     args = parser.parse_args()
 
     if len(args.configs) != len(args.checkpoints):
@@ -234,10 +277,17 @@ def main():
     if args.weights:
         with open(args.weights) as f:
             weights = json.load(f)
-        print(f"Loaded weights from {args.weights}")
+        print(f"Loaded dice weights from {args.weights}")
 
-    run_ensemble(configs, args.checkpoints, args.input_dir, args.output_dir,
-                 weights=weights, min_size=args.min_size, max_cases=args.max_cases)
+    if args.weighting == "dice_weighted" and weights is None:
+        raise ValueError("--weighting dice_weighted requires --weights <path-to-json>")
+
+    run_ensemble(
+        configs, args.checkpoints, args.input_dir, args.output_dir,
+        weights=weights, weighting=args.weighting,
+        min_size=args.min_size, max_cases=args.max_cases,
+        use_tta=args.tta, anatomy_fix=not args.no_anatomy_fix,
+    )
 
 
 if __name__ == "__main__":

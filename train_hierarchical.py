@@ -115,6 +115,7 @@ def main():
         lambda_tc=config["loss"].get("lambda_tc", 1.0),
         lambda_et=config["loss"].get("lambda_et", 1.0),
         lambda_rc=config["loss"].get("lambda_rc", 2.0),
+        lambda_hausdorff=config["loss"].get("lambda_hausdorff", 0.0),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),

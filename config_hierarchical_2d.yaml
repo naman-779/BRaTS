@@ -38,6 +38,7 @@ loss:
   lambda_tc: 1.0
   lambda_et: 1.0
   lambda_rc: 2.0         # upweight RC — rarest and hardest region
+  lambda_hausdorff: 0.1  # boundary-aware HausdorffDT term; set to 0.0 to disable
 
 # --- Optimizer ---
 optimizer:

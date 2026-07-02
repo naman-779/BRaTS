@@ -29,6 +29,41 @@ class ConvertBraTSLabelsToRegions:
         return regions
 
 
+class AnatomicalConstraints:
+    """
+    Enforce ET subset-of-TC anatomical constraint at post-processing time.
+
+    Any ET (label 3) connected component that has no NETC (label 1) neighbour
+    within dilation_radius voxels is reclassified as NETC. Isolated ET blobs
+    are almost always false-positive predictions: the tumour core is present
+    but the model over-predicts the enhancing sub-region.
+    """
+
+    def __init__(self, dilation_radius: int = 3):
+        self.dilation_radius = dilation_radius
+
+    def __call__(self, seg: np.ndarray) -> np.ndarray:
+        import cc3d
+        from scipy.ndimage import binary_dilation
+
+        seg = seg.copy()
+        et_mask = seg == 3
+        if et_mask.sum() == 0:
+            return seg
+
+        netc_mask = seg == 1
+        r = self.dilation_radius
+        struct = np.ones((2 * r + 1, 2 * r + 1, 2 * r + 1), dtype=bool)
+        netc_dilated = binary_dilation(netc_mask, structure=struct)
+
+        et_comps = cc3d.connected_components(et_mask.astype(np.uint8), connectivity=26)
+        for comp_id in range(1, int(et_comps.max()) + 1):
+            comp_mask = et_comps == comp_id
+            if not np.any(comp_mask & netc_dilated):
+                seg[comp_mask] = 1  # reclassify isolated ET as NETC
+        return seg
+
+
 class RemoveSmallConnectedComponents(MapTransform):
     """Remove connected components smaller than min_size voxels from each
     foreground class in the predicted segmentation."""
